@@ -1,0 +1,183 @@
+TYPE="type"
+ARGS="args"
+RETURN="return"
+EXCP="exceptions"
+TARGET="target"
+FUNC="func"
+OBJC="objc"
+
+mycontext['filesize_tracker'] = {}
+mycontext['filesize_lock'] = createlock()
+mycontext['file_locks'] = {}
+
+def _read_file_contents(f):
+  data = ""
+  offset = 0
+  while True:
+    try:
+      chunk = f.readat(1024, offset)
+      if chunk == "" or chunk is None:
+        break
+      data += chunk
+      offset += len(chunk)
+    except:
+      break
+  return data
+
+class ABFile():
+  def __init__(self, filename, create):
+    mycontext['debug'] = False
+
+    self.filename = filename
+    self.Afn = filename + '.a'
+    self.Bfn = filename + '.b'
+
+    mycontext['filesize_lock'].acquire(True)
+    if filename not in mycontext['file_locks']:
+      mycontext['file_locks'][filename] = createlock()
+    mycontext['filesize_lock'].release()
+
+    mycontext['file_locks'][filename].acquire(True)
+
+    self.Afile = _orig_openfile(self.Afn, create)
+    self.Bfile = _orig_openfile(self.Bfn, create)
+
+    if create:
+      self.Afile.writeat("SE", 0)
+      mycontext['filesize_lock'].acquire(True)
+      mycontext['filesize_tracker'][self.filename] = 2
+      mycontext['filesize_lock'].release()
+    else:
+      existing = _read_file_contents(self.Afile)
+      self.Bfile.writeat(existing, 0)
+      mycontext['filesize_lock'].acquire(True)
+      mycontext['filesize_tracker'][self.filename] = len(existing)
+      mycontext['filesize_lock'].release()
+
+    mycontext['file_locks'][filename].release()
+
+  def writeat(self, data, offset):
+    mycontext['file_locks'][self.filename].acquire(True)
+    current_size = mycontext['filesize_tracker'].get(self.filename, 0)
+    if offset > current_size:
+      mycontext['file_locks'][self.filename].release()
+      return
+    result = self.Bfile.writeat(data, offset)
+    mycontext['filesize_lock'].acquire(True)
+    mycontext['filesize_tracker'][self.filename] = max(current_size, offset + len(data))
+    mycontext['filesize_lock'].release()
+    mycontext['file_locks'][self.filename].release()
+    return result
+
+  def readat(self, bytes, offset):
+    if bytes is None:
+      return _read_file_contents(self.Afile)
+    return self.Afile.readat(bytes, offset)
+
+  def close(self):
+    mycontext['file_locks'][self.filename].acquire(True)
+    data = _read_file_contents(self.Bfile)
+    valid = (len(data) >= 2 and data[0] == 'S' and data[-1] == 'E')
+
+    if valid:
+      self.Afile.close()
+      self.Afile = _orig_openfile(self.Afn, True)
+      self.Afile.writeat(data, 0)
+      mycontext['filesize_lock'].acquire(True)
+      mycontext['filesize_tracker'][self.filename] = len(data)
+      mycontext['filesize_lock'].release()
+    else:
+      existing = _read_file_contents(self.Afile)
+      mycontext['filesize_lock'].acquire(True)
+      mycontext['filesize_tracker'][self.filename] = len(existing)
+      mycontext['filesize_lock'].release()
+
+    self.Afile.close()
+    self.Bfile.close()
+    mycontext['file_locks'][self.filename].release()
+
+  def getfilesize(self):
+    mycontext['filesize_lock'].acquire(True)
+    size = mycontext['filesize_tracker'].get(self.filename, 0)
+    mycontext['filesize_lock'].release()
+    return size
+
+
+_orig_openfile = openfile
+_orig_removefile = removefile
+_orig_listfiles = listfiles
+
+
+def secure_openfile(filename, create):
+  if filename.endswith('.a') or filename.endswith('.b'):
+    raise Exception("Access denied")
+  return _orig_openfile(filename, create)
+
+
+def secure_removefile(filename):
+  if filename.endswith('.a') or filename.endswith('.b'):
+    raise Exception("Access denied")
+  mycontext['filesize_lock'].acquire(True)
+  if filename in mycontext['filesize_tracker']:
+    del mycontext['filesize_tracker'][filename]
+  if filename in mycontext['file_locks']:
+    del mycontext['file_locks'][filename]
+  mycontext['filesize_lock'].release()
+  return _orig_removefile(filename)
+
+
+def secure_listfiles():
+  files = _orig_listfiles()
+  filtered = []
+  for f in files:
+    if not (f.endswith('.a') or f.endswith('.b')):
+      filtered.append(f)
+  return filtered
+
+
+def ABopenfile(filename, create):
+  return ABFile(filename, create)
+
+
+CHILD_CONTEXT_DEF["openfile"] = {
+  TYPE: FUNC,
+  ARGS: (str, bool),
+  EXCP: Exception,
+  RETURN: object,
+  TARGET: secure_openfile
+}
+
+CHILD_CONTEXT_DEF["removefile"] = {
+  TYPE: FUNC,
+  ARGS: (str,),
+  EXCP: Exception,
+  RETURN: type(None),
+  TARGET: secure_removefile
+}
+
+CHILD_CONTEXT_DEF["listfiles"] = {
+  TYPE: FUNC,
+  ARGS: None,
+  EXCP: Exception,
+  RETURN: list,
+  TARGET: secure_listfiles
+}
+
+sec_file_def = {
+  "obj-type": ABFile,
+  "name": "ABFile",
+  "writeat": {"type":"func","args":(str,int),"exceptions":Exception,"return":(int,type(None)),"target":ABFile.writeat},
+  "readat":  {"type":"func","args":((int,type(None)),(int)),"exceptions":Exception,"return":str,"target":ABFile.readat},
+  "close":   {"type":"func","args":None,"exceptions":None,"return":(bool,type(None)),"target":ABFile.close},
+  "getfilesize": {"type":"func","args":None,"exceptions":Exception,"return":int,"target":ABFile.getfilesize}
+}
+
+CHILD_CONTEXT_DEF["ABopenfile"] = {
+  TYPE: OBJC,
+  ARGS: (str, bool),
+  EXCP: Exception,
+  RETURN: sec_file_def,
+  TARGET: ABopenfile
+}
+
+secure_dispatch_module()
